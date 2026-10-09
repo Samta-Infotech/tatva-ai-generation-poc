@@ -1,0 +1,11 @@
+langgraph>=0.2.60
+pydantic>=2.8
+pytest>=8.0
+python-dotenv>=1.0
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.28
+Django>=4.2
+djangorestframework>=3.16
+pytest-django>=4.11
+Flask>=3.1
