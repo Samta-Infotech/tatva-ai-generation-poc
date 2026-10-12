@@ -728,12 +728,13 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
         conftest_entries = [e for e in test_manifest if "conftest" in e.get("path", "")]
         test_path = actual_tests[0]["path"] if actual_tests else _default_test_path(profile, "public")
 
-        conftest_prompt = ""
-        if conftest_entries:
-            conftest_prompt = (
-                f" Also generate a conftest.py file with shared pytest fixtures. "
-                "Include the conftest content as a separate entry in a JSON array. "
-            )
+        ref_files = state.get("reference_files", [])
+        ref_source = {}
+        for rf in ref_files:
+            path_lower = rf["path"].lower()
+            if any(skip in path_lower for skip in ("__init__", "manage.py", "settings.py", "urls.py", "pytest.ini")):
+                continue
+            ref_source[rf["path"]] = rf["content"][:3000]
 
         try:
             raw = _call_with_timeout(
@@ -742,6 +743,10 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
                     f"Generate public test file '{test_path}' for the PBQ. "
                     "Tests must verify the behavioral contract (not implementation details). "
                     "Include 2-3 test cases covering the happy path and basic validation. "
+                    "CRITICAL: Read the reference implementation carefully. Only assert behavior that the "
+                    "reference code ACTUALLY produces. Do not assume behavior that is not in the code. "
+                    "For React @testing-library tests: use exact accessible names without extra whitespace, "
+                    "use getByText for text content and getByRole for interactive/heading elements. "
                     "Return strict JSON with keys: path, content, kind ('file'). "
                     "Test content must be complete, runnable test code with proper imports. "
                     "Include all needed fixtures directly in the test file or use Django's built-in test utilities. "
@@ -752,7 +757,7 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
                 context={
                     "test_role": "public",
                     "behavioral_contract": contract,
-                    "file_manifest": [{"path": e["path"], "description": e.get("description", "")} for e in manifest if e.get("role") == "reference"],
+                    "reference_source": ref_source,
                     "runtime_profile": profile.to_dict(),
                     "difficulty": request.difficulty,
                 },
@@ -797,8 +802,13 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
         actual_tests = [e for e in test_manifest if "conftest" not in e.get("path", "")]
         test_path = actual_tests[0]["path"] if actual_tests else _default_test_path(profile, "private")
 
-        # Private tests get reference file summaries to test edge cases
-        ref_summary = _interface_summary(ref_files, [e["path"] for e in ref_files])
+        # Private tests get full reference source to write accurate assertions
+        ref_source = {}
+        for rf in ref_files:
+            path_lower = rf["path"].lower()
+            if any(skip in path_lower for skip in ("__init__", "manage.py", "settings.py", "urls.py", "pytest.ini")):
+                continue
+            ref_source[rf["path"]] = rf["content"][:3000]
 
         try:
             raw = _call_with_timeout(
@@ -808,6 +818,11 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
                     "Private tests must catch common implementation mistakes (mutations). "
                     "Include 3-5 test cases covering edge cases, boundary conditions, and error handling. "
                     "These tests must fail when the implementation has subtle bugs. "
+                    "CRITICAL: Read the reference implementation carefully. Only assert behavior that the "
+                    "reference code ACTUALLY produces. Do not assume behavior that is not in the code. "
+                    "For React @testing-library tests: use exact accessible names without extra whitespace, "
+                    "use getByText for text content and getByRole for interactive/heading elements, "
+                    "and verify test data matches what the component actually renders with that data. "
                     "Return strict JSON with keys: path, content, kind ('file'). "
                     "Include all needed fixtures directly in the test file. "
                     "Do NOT rely on a separate conftest.py — put all fixtures in the test file itself. "
@@ -817,7 +832,7 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
                 context={
                     "test_role": "private",
                     "behavioral_contract": contract,
-                    "reference_interfaces": ref_summary,
+                    "reference_source": ref_source,
                     "runtime_profile": profile.to_dict(),
                     "difficulty": state["request"].difficulty,
                 },

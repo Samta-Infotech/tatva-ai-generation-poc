@@ -881,16 +881,30 @@ def _repair_pbq_bundle_with_slm(state: PBQState, gateway: ModelGateway, reason: 
             "Never use TODO, placeholder comments, `pass` as a function body, or `...` in any file."
         )
     else:
+        test_stderr = ""
+        for cmd in state.validation.get("reference_execution", []):
+            if isinstance(cmd, dict) and cmd.get("exit_code") != 0:
+                test_stderr = (cmd.get("stderr") or "")[:2000]
+                break
         prompt = (
             "Repair this PBQ bundle using the validation feedback. Return the full corrected PBQ bundle "
             "as strict JSON with the same keys: requirements, design, starter_files, reference_solution, "
-            "public_tests, private_tests, mutations. Fix the reference solution and/or tests so the "
-            "reference commands pass and private tests catch the mutations. Keep paths safe and keep the "
-            "bundle small. public_tests and private_tests must be test files with path/content/kind, "
-            "not command objects. Django and FastAPI tests must import functions/classes directly or define "
-            "any pytest fixtures they use; do not leave undefined fixtures. For FastAPI tests, import app using "
+            "public_tests, private_tests, mutations. "
+            "IMPORTANT: Read the test failure output carefully. If tests fail because they assert behavior "
+            "the reference implementation does not support, FIX THE TESTS to match the actual reference "
+            "implementation — do NOT change working reference code to match broken test assertions. "
+            "Tests must only assert behavior that the reference implementation actually produces. "
+            "For React tests using @testing-library: use exact accessible names (no leading/trailing "
+            "whitespace in name queries), use getByText for non-heading content, and ensure test data "
+            "matches what the component actually renders. "
+            "Keep paths safe and keep the bundle small. "
+            "public_tests and private_tests must be test files with path/content/kind, not command objects. "
+            "Django and FastAPI tests must import functions/classes directly or define any pytest fixtures "
+            "they use; do not leave undefined fixtures. For FastAPI tests, import app using "
             "`from app.main import app` and initialize `client = TestClient(app)`. Never use `TestClient(...)`, "
-            "`...`, TODO, placeholder comments, or `pass` as a function body in reference_solution, public_tests, or private_tests."
+            "`...`, TODO, placeholder comments, or `pass` as a function body in reference_solution, "
+            "public_tests, or private_tests."
+            + (f"\n\nTest failure output:\n{test_stderr}" if test_stderr else "")
         )
 
     raw = gateway.structured_generate(
