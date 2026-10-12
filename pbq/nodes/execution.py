@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
+from config.settings import EXECUTE_REF_TIMEOUT_SECONDS
 from pbq.state import PBQState
 from runtime.executor import ensure_npm_cache, ensure_runtime_venv, inject_npm_cache, run_command
 
@@ -12,6 +14,13 @@ def execute_reference(
 ) -> PBQState:
     assert state.runtime_profile is not None
     reference = state.output_dir / "reference_workspace"
+    start = time.monotonic()
+    per_cmd_timeout = max(30, EXECUTE_REF_TIMEOUT_SECONDS // 3)
+    test_timeout = max(per_cmd_timeout, EXECUTE_REF_TIMEOUT_SECONDS - 30)
+
+    def _remaining() -> int:
+        elapsed = time.monotonic() - start
+        return max(10, int(EXECUTE_REF_TIMEOUT_SECONDS - elapsed))
 
     def _progress(msg: str) -> None:
         if on_progress:
@@ -41,18 +50,31 @@ def execute_reference(
 
     if state.runtime_profile.install_command and not deps_ready:
         _progress(f"Running: {state.runtime_profile.install_command}")
+        timeout = min(per_cmd_timeout, _remaining())
         commands.append(
-            run_command(state.runtime_profile.install_command, cwd=reference, extra_env=extra_env).to_dict()
+            run_command(state.runtime_profile.install_command, cwd=reference, extra_env=extra_env, timeout=timeout).to_dict()
         )
+        if commands[-1].get("timed_out"):
+            _progress("Install timed out — skipping remaining steps")
+            state.validation["reference_execution"] = commands
+            state.validation["reference_passed"] = False
+            return state
 
     if state.runtime_profile.validation_command:
         _progress(f"Running: {state.runtime_profile.validation_command}")
+        timeout = min(per_cmd_timeout, _remaining())
         commands.append(
-            run_command(state.runtime_profile.validation_command, cwd=reference, extra_env=extra_env).to_dict()
+            run_command(state.runtime_profile.validation_command, cwd=reference, extra_env=extra_env, timeout=timeout).to_dict()
         )
+        if commands[-1].get("exit_code") != 0:
+            _progress("Validation failed — skipping test execution")
+            state.validation["reference_execution"] = commands
+            state.validation["reference_passed"] = False
+            return state
 
     _progress(f"Running: {state.runtime_profile.test_command}")
-    commands.append(run_command(state.runtime_profile.test_command, cwd=reference, extra_env=extra_env).to_dict())
+    timeout = min(test_timeout, _remaining())
+    commands.append(run_command(state.runtime_profile.test_command, cwd=reference, extra_env=extra_env, timeout=timeout).to_dict())
 
     state.validation["reference_execution"] = commands
     state.validation["reference_passed"] = all(

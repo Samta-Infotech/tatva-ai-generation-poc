@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,26 @@ from typing import Any
 logger = logging.getLogger("tatva.poc")
 
 import uvicorn
+
+# Prevent uvicorn --reload from restarting when files are written to outputs/
+_outputs_abs = str((Path(__file__).resolve().parent / os.getenv("POC_OUTPUT_DIR", "outputs")).resolve())
+try:
+    from uvicorn.config import Config as _UvConfig
+    _orig_bind = getattr(_UvConfig, "bind_socket", None)
+    _orig_init = _UvConfig.__init__
+
+    def _patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        _orig_init(self, *args, **kwargs)
+        if self.reload:
+            excludes = set(self.reload_excludes or [])
+            excludes.update([_outputs_abs, "outputs", "*.json"])
+            self.reload_excludes = list(excludes)
+            if not self.reload_includes:
+                self.reload_includes = ["*.py", "*.html"]
+
+    _UvConfig.__init__ = _patched_init  # type: ignore[assignment]
+except Exception:
+    pass
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -37,9 +58,11 @@ from pbq.graph import (
     repair_pbq_from_validation_feedback,
     run_pbq_graph,
 )
+from pbq.nodes.contract_coverage import validate_contract_coverage
 from pbq.nodes.difficulty import validate_pbq_difficulty
 from pbq.nodes.execution import execute_reference
 from pbq.nodes.mutation import validate_test_strength
+from pbq.nodes.solver_validation import validate_with_independent_solver
 from pbq.nodes.workspace import generate_candidate_workspace, materialize_reference_workspace
 from pbq.schemas import PBQBundle, PBQDesign, PBQRequest
 from pbq.state import PBQState
@@ -71,6 +94,13 @@ def _startup() -> None:
     tasks_dir = settings.OUTPUT_DIR / "tasks"
     prog.configure(tasks_dir)
     logger.info("TATVA POC API started — tasks dir: %s", tasks_dir)
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    logger.info("Shutdown event — persisting running task state for restart recovery")
+    for task in prog.all_running_tasks():
+        prog._persist(task)
 
 
 class PBQRunRequest(BaseModel):
@@ -157,6 +187,9 @@ def get_task(task_id: str) -> dict[str, Any]:
     task = prog.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    if task.is_stale():
+        logger.warning("task %s detected as stale (no progress for %ds) — aborting", task_id, prog.TASK_STALE_SECONDS)
+        task.abort_remaining("Task timed out — no progress for too long")
     return task.to_dict()
 
 
@@ -345,10 +378,10 @@ def _make_progress_callback(task: prog.TaskProgress):
             step.skip(msg)
             logger.info("task %s [%s] skipped: %s", task.task_id, step_key, msg)
         elif status == "update":
-            # Message-only update for a step already running — does not change timing
             if msg:
                 step.message = msg
             logger.info("task %s [%s] update: %s", task.task_id, step_key, msg)
+        task.touch()
         prog._persist(task)
     return _cb
 
@@ -372,7 +405,7 @@ def _run_generate_task(task: prog.TaskProgress, payload: PBQRunRequest, runtime:
         task.overall_status = "done"
         prog._persist(task)
         logger.info("generate task %s done: status=%s", task.task_id, state.final.get("final_status"))
-    except Exception as exc:
+    except BaseException as exc:
         logger.exception("generate task %s failed: %s", task.task_id, exc)
         task.abort_remaining(str(exc))
 
@@ -451,6 +484,36 @@ def _run_validate_task(
         cb("execute_tests", "done", f"Reference {'passed' if ref_passed else 'failed'}")
         logger.info("%s task %s: reference_passed=%s", op, task.task_id, ref_passed)
 
+        if ref_passed:
+            cb("contract_coverage", "start", "Checking contract-test alignment...")
+            try:
+                state = validate_contract_coverage(state, gateway)
+            except Exception as exc:
+                logger.warning("contract_coverage failed in %s task: %s", op, exc)
+            cc_verdict = (state.validation.get("contract_coverage") or {}).get("verdict", "skipped")
+            cb("contract_coverage", "done", f"Verdict: {cc_verdict}")
+        else:
+            step = task.get_step("contract_coverage")
+            if step:
+                step.skip("Reference failed")
+
+        if ref_passed:
+            cb("solver_validation", "start", "Running independent solver check...")
+            _sv_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _sv_fut = _sv_pool.submit(validate_with_independent_solver, state, gateway)
+            try:
+                state = _sv_fut.result(timeout=settings.AI_STEP_TIMEOUT_SECONDS)
+            except (concurrent.futures.TimeoutError, Exception) as exc:
+                logger.warning("solver_validation timed out or failed in %s task: %s", op, exc)
+            finally:
+                _sv_pool.shutdown(wait=False)
+            sv_verdict = (state.validation.get("solver_validation") or {}).get("verdict", "skipped")
+            cb("solver_validation", "done", f"Verdict: {sv_verdict}")
+        else:
+            step = task.get_step("solver_validation")
+            if step:
+                step.skip("Reference failed")
+
         cb("mutation_testing", "start", "Running mutation testing...")
         state = validate_test_strength(state)
         score = state.validation.get("mutation_score", "n/a")
@@ -484,7 +547,7 @@ def _run_validate_task(
         task.overall_status = "done"
         prog._persist(task)
         logger.info("%s task %s done: status=%s", op, task.task_id, final_status)
-    except Exception as exc:
+    except BaseException as exc:
         logger.exception("%s task %s failed: %s", op, task.task_id, exc)
         task.abort_remaining(str(exc))
 
@@ -492,13 +555,24 @@ def _run_validate_task(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the TATVA AI Generation POC FastAPI server")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
-    reload_kwargs = {}
-    if args.reload:
-        reload_kwargs["reload_excludes"] = ["outputs"]
-    uvicorn.run("api:app", host=args.host, port=args.port, reload=args.reload, **reload_kwargs)
+    uvicorn.run(
+        "api:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        reload_dirs=[str(ROOT_DIR)] if args.reload else None,
+        reload_includes=["*.py", "*.html"] if args.reload else None,
+        reload_excludes=[
+            str(settings.OUTPUT_DIR),
+            "outputs",
+            "*.json",
+            "__pycache__",
+            ".pytest_cache",
+        ] if args.reload else None,
+    )
 
 
 def _read_json(path):

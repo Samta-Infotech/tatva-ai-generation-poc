@@ -36,6 +36,8 @@ GENERATE_STEPS: list[tuple[str, str]] = [
     ("build_workspace", "Build Workspaces"),
     ("execute_tests", "Execute Reference Tests"),
     ("ai_repair_ref", "AI Repair Reference"),
+    ("contract_coverage", "Contract-Test Coverage"),
+    ("solver_validation", "Independent Solver Check"),
     ("mutation_testing", "Mutation Testing"),
     ("ai_repair_tests", "AI Repair Tests"),
     ("validate_difficulty", "Validate Difficulty"),
@@ -55,6 +57,8 @@ VALIDATE_STEPS: list[tuple[str, str]] = [
     ("build_workspace", "Build Workspaces"),
     ("execute_tests", "Execute Reference Tests"),
     ("ai_repair_ref", "AI Repair Reference"),
+    ("contract_coverage", "Contract-Test Coverage"),
+    ("solver_validation", "Independent Solver Check"),
     ("mutation_testing", "Mutation Testing"),
     ("ai_repair_tests", "AI Repair Tests"),
     ("validate_difficulty", "Validate Difficulty"),
@@ -66,6 +70,8 @@ REGENERATE_STEPS: list[tuple[str, str]] = [
     ("build_workspace", "Build Workspaces"),
     ("ai_repair_ref", "AI Repair with AI"),
     ("execute_tests", "Execute Reference Tests"),
+    ("contract_coverage", "Contract-Test Coverage"),
+    ("solver_validation", "Independent Solver Check"),
     ("mutation_testing", "Mutation Testing"),
     ("ai_repair_tests", "AI Repair Tests"),
     ("validate_difficulty", "Validate Difficulty"),
@@ -126,6 +132,9 @@ class ProgressStep:
         }
 
 
+TASK_STALE_SECONDS = 600
+
+
 @dataclass
 class TaskProgress:
     task_id: str
@@ -136,6 +145,15 @@ class TaskProgress:
     result: Optional[dict[str, Any]] = None
     error_message: str = ""
     created_at: float = field(default_factory=time.monotonic)
+    last_activity: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+
+    def is_stale(self) -> bool:
+        if self.overall_status != "running":
+            return False
+        return (time.monotonic() - self.last_activity) > TASK_STALE_SECONDS
 
     def get_step(self, key: str) -> Optional[ProgressStep]:
         return next((s for s in self.steps if s.key == key), None)
@@ -181,6 +199,28 @@ def configure(tasks_dir: Path) -> None:
     global _tasks_dir
     _tasks_dir = tasks_dir
     tasks_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_tasks(tasks_dir)
+
+
+def _cleanup_stale_tasks(tasks_dir: Path) -> None:
+    """Mark any 'running' tasks from a previous server process as crashed."""
+    for path in tasks_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("overall_status") == "running":
+                data["overall_status"] = "error"
+                data["error_message"] = "Server restarted while task was running"
+                for step in data.get("steps", []):
+                    if step.get("status") == "running":
+                        step["status"] = "error"
+                        step["message"] = "Server restarted"
+                    elif step.get("status") == "pending":
+                        step["status"] = "skipped"
+                        step["message"] = "aborted"
+                path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                logger.info("Marked stale task %s as crashed", path.stem)
+        except Exception:
+            pass
 
 
 def _persist(task: TaskProgress) -> None:
@@ -243,6 +283,11 @@ def get_runtime_task(runtime: str) -> Optional[TaskProgress]:
         if task_id:
             return _tasks.get(task_id)
     return None
+
+
+def all_running_tasks() -> list[TaskProgress]:
+    with _lock:
+        return [t for t in _tasks.values() if t.overall_status == "running"]
 
 
 def _task_from_dict(data: dict[str, Any]) -> TaskProgress:

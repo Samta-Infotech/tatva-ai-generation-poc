@@ -84,10 +84,22 @@ def safe_file_entries(raw_items: Any, field_name: str) -> list[FileEntry]:
             raise ValueError(f"{field_name} contains empty file: {path}")
         if len(content) > 50000:
             raise ValueError(f"{field_name} file is too large: {path}")
+        if path.endswith(".py"):
+            try:
+                compile(content, path, "exec")
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{field_name} contains Python syntax error in {path} "
+                    f"(line {exc.lineno}): {exc.msg}"
+                ) from None
         if field_name in {"reference_solution", "public_tests", "private_tests"}:
             lowered = content.lower()
             blocked_markers = ("testclient(...)", "placeholder", "todo", "not implemented")
-            empty_function = re.search(r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*:\s*\n\s*pass\s*(#.*)?$", content, re.MULTILINE)
+            empty_function = re.search(
+                r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*:\s*(\n\s*)?pass\s*(#.*)?$",
+                content,
+                re.MULTILINE,
+            )
             if any(marker in lowered for marker in blocked_markers) or empty_function:
                 raise ValueError(f"{field_name} contains placeholder implementation: {path}")
         entries.append(FileEntry(path=path, content=content, kind=kind))

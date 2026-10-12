@@ -24,12 +24,14 @@ from config.pbq_templates import (
 from config.runtime_profiles import RuntimeProfile, get_runtime_profile
 from config.settings import AI_STEP_TIMEOUT_SECONDS, DESIGN_TIMEOUT_SECONDS, EXECUTE_REF_TIMEOUT_SECONDS, MODEL_PROVIDER, OUTPUT_DIR, PBQ_STAGED_GENERATION
 from models.gateway import ModelGateway
+from pbq.nodes.contract_coverage import validate_contract_coverage
 from pbq.nodes.design import repair_pbq_design, validate_pbq_design
 from pbq.nodes.difficulty import validate_pbq_difficulty
 from pbq.nodes.execution import execute_reference
 from pbq.nodes.mutation import validate_test_strength
 from pbq.nodes.repair import repair_reference, repair_tests
 from pbq.nodes.requirements import analyze_pbq_requirements
+from pbq.nodes.solver_validation import validate_with_independent_solver
 from pbq.nodes.workspace import generate_candidate_workspace, materialize_reference_workspace
 from pbq.schemas import PBQBundle, PBQDesign, PBQRequest
 from pbq.state import PBQState
@@ -826,13 +828,60 @@ def _first_failure_block(text: str) -> str:
     return ""
 
 
+_SENTINEL_MARKERS = (
+    "test_ai_generation_must_be_repaired",
+    "ai generated an invalid pbq bundle",
+)
+
+
+def _is_sentinel_test(entry: FileEntry) -> bool:
+    lowered = entry.content.lower()
+    return any(m in lowered for m in _SENTINEL_MARKERS)
+
+
+def _strip_sentinel_tests(bundle: PBQBundle) -> PBQBundle:
+    """Remove sentinel 'assert False' test files injected by ai_generation_failed_bundle
+    once the repair has generated real test files."""
+    real_public = [f for f in bundle.public_tests if not _is_sentinel_test(f)]
+    real_private = [f for f in bundle.private_tests if not _is_sentinel_test(f)]
+    if real_public:
+        bundle.public_tests = real_public
+    if real_private:
+        bundle.private_tests = real_private
+    return bundle
+
+
+def _bundle_has_only_sentinels(bundle: PBQBundle) -> bool:
+    all_tests = bundle.public_tests + bundle.private_tests
+    if not all_tests:
+        return True
+    return all(_is_sentinel_test(t) for t in all_tests)
+
+
 def _repair_pbq_bundle_with_slm(state: PBQState, gateway: ModelGateway, reason: str) -> PBQState:
     assert state.bundle is not None
     assert state.runtime_profile is not None
     if gateway.provider not in {"ollama", "openai", "openai-compatible"} or state.runtime_profile.id not in SLM_GENERATED_PBQ_PROFILES:
         return state
-    raw = gateway.structured_generate(
-        (
+
+    is_total_failure = _bundle_has_only_sentinels(state.bundle)
+    if is_total_failure:
+        prompt = (
+            "The initial PBQ generation completely failed. Generate a COMPLETE working PBQ bundle from scratch. "
+            "Return strict JSON with: requirements (dict), design (with title, behavioral_contract as list of strings, "
+            "scaffolding_strategy, candidate_freedom as list, difficulty_notes as list), "
+            "starter_files (list of {path, content, kind}), reference_solution (list of {path, content, kind}), "
+            "public_tests (list of {path, content, kind}), private_tests (list of {path, content, kind}), "
+            "mutations (list of {name, changes: [{path, content}]}). "
+            "IMPORTANT: Every file entry MUST be an object with 'path' (string), 'content' (string), and 'kind' (string, default 'file'). "
+            "Do NOT use string values for file entries. "
+            "The reference_solution must contain COMPLETE working code that passes all tests. "
+            "starter_files must contain skeleton code with empty function bodies for the candidate. "
+            "Tests must use the framework's test client, not call internal functions directly. "
+            "Never use TODO, placeholder comments, `pass` as a function body, or `...` in any file."
+        )
+    else:
+        prompt = (
             "Repair this PBQ bundle using the validation feedback. Return the full corrected PBQ bundle "
             "as strict JSON with the same keys: requirements, design, starter_files, reference_solution, "
             "public_tests, private_tests, mutations. Fix the reference solution and/or tests so the "
@@ -842,12 +891,18 @@ def _repair_pbq_bundle_with_slm(state: PBQState, gateway: ModelGateway, reason: 
             "any pytest fixtures they use; do not leave undefined fixtures. For FastAPI tests, import app using "
             "`from app.main import app` and initialize `client = TestClient(app)`. Never use `TestClient(...)`, "
             "`...`, TODO, placeholder comments, or `pass` as a function body in reference_solution, public_tests, or private_tests."
-        ),
+        )
+
+    raw = gateway.structured_generate(
+        prompt,
         schema_name="PBQExecutableBundleRepair",
         context={
             "repair_reason": reason,
+            "is_total_failure": is_total_failure,
             "runtime_profile": state.runtime_profile.to_dict(),
             "framework_rules": _framework_generation_rules(state.runtime_profile),
+            "user_prompt": state.request.prompt,
+            "difficulty": state.request.difficulty,
             "previous_bundle": state.bundle.to_dict(),
             "reference_execution": state.validation.get("reference_execution", []),
             "mutation_results": state.mutation,
@@ -869,6 +924,7 @@ def _repair_pbq_bundle_with_slm(state: PBQState, gateway: ModelGateway, reason: 
     repaired.requirements["slm_repair_generation"] = raw
     repaired.design.difficulty_notes.append(f"SLM repair applied after validation feedback: {reason}")
     repaired = _merge_template_starter_files(repaired, state.request)
+    repaired = _strip_sentinel_tests(repaired)
     state.bundle = _ensure_profile_support_files(repaired, state.runtime_profile)
     state.validation.setdefault("repairs", []).append(f"SLM repair applied: {reason}")
     state = generate_candidate_workspace(state)
@@ -982,12 +1038,25 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
+def _has_unfair_tests(state: PBQState) -> bool:
+    """Check if contract coverage or solver validation flagged unfair tests."""
+    cc = state.validation.get("contract_coverage", {})
+    if cc.get("verdict") in ("has_unfair_tests", "fail"):
+        return True
+    sv = state.validation.get("solver_validation", {})
+    if sv.get("verdict") == "needs_review" and sv.get("solver_produced_files"):
+        return True
+    return False
+
+
 def finalize_pbq(state: PBQState) -> PBQState:
     assert state.bundle is not None
     assert state.runtime_profile is not None
     final_status = "passed"
     if not state.validation.get("reference_passed"):
         final_status = "reference_failed"
+    elif _has_unfair_tests(state):
+        final_status = "unfair_tests"
     elif not state.validation.get("tests_strong_enough"):
         final_status = "weak_tests"
     elif not state.validation.get("difficulty_matches_request"):
@@ -1017,6 +1086,8 @@ def finalize_pbq(state: PBQState) -> PBQState:
             state.mutation,
         ),
         "difficulty_validation": state.difficulty,
+        "contract_coverage": state.validation.get("contract_coverage", {}),
+        "solver_validation": state.validation.get("solver_validation", {}),
         "validation_repairs": state.validation.get("repairs", []),
         "repair_count": state.metrics.repair_count,
         "metrics": state.metrics.to_dict(),
@@ -1181,6 +1252,38 @@ def run_pbq_graph(
         _emit("ai_repair_ref", "done")
     else:
         _emit("ai_repair_ref", "skip", "Reference passed — repair not needed")
+
+    if state.validation.get("reference_passed"):
+        _emit("contract_coverage", "start", "Checking contract-test alignment...")
+        _cc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        _cc_fut = _cc_pool.submit(validate_contract_coverage, state, gateway)
+        try:
+            state = _cc_fut.result(timeout=AI_STEP_TIMEOUT_SECONDS)
+        except (concurrent.futures.TimeoutError, Exception) as exc:
+            logger.warning("contract_coverage timed out or failed: %s", exc)
+        finally:
+            _cc_pool.shutdown(wait=False)
+        cc = state.validation.get("contract_coverage", {})
+        cc_verdict = cc.get("verdict", "skipped")
+        _emit("contract_coverage", "done", f"Verdict: {cc_verdict}")
+    else:
+        _emit("contract_coverage", "skip", "Reference failed — skipping contract coverage")
+
+    if state.validation.get("reference_passed"):
+        _emit("solver_validation", "start", "Running independent solver check...")
+        _sv_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        _sv_fut = _sv_pool.submit(validate_with_independent_solver, state, gateway)
+        try:
+            state = _sv_fut.result(timeout=AI_STEP_TIMEOUT_SECONDS)
+        except (concurrent.futures.TimeoutError, Exception) as exc:
+            logger.warning("solver_validation timed out or failed: %s", exc)
+        finally:
+            _sv_pool.shutdown(wait=False)
+        sv = state.validation.get("solver_validation", {})
+        sv_verdict = sv.get("verdict", "skipped")
+        _emit("solver_validation", "done", f"Verdict: {sv_verdict}")
+    else:
+        _emit("solver_validation", "skip", "Reference failed — skipping solver validation")
 
     _emit("mutation_testing", "start", "Running mutation testing...")
     state = validate_test_strength(state)

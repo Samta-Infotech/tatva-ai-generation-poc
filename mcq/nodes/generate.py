@@ -120,5 +120,5 @@ def generate_mcq(state: MCQState, gateway: ModelGateway) -> MCQState:
             "difficulty_blueprint": state.blueprint.__dict__,
         },
     )
-    state.mcq = _mcq_from_slm(raw, state, fallback) if gateway.provider == "ollama" else fallback
+    state.mcq = _mcq_from_slm(raw, state, fallback) if gateway.provider in {"ollama", "openai", "openai-compatible"} else fallback
     return state

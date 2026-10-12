@@ -148,8 +148,9 @@ INDEX_HTML = """<!doctype html>
     .pill.passed { color: var(--ok); background: #e8f5ee; }
     .pill.killed { color: var(--ok); background: #e8f5ee; }
     .pill.survived { color: var(--danger); background: #faecea; }
-    .pill.failed, .pill.reference_failed, .pill.weak_tests { color: var(--danger); background: #faecea; }
-    .pill.needs_repair { color: var(--warn); background: #fff4d7; }
+    .pill.failed, .pill.reference_failed, .pill.weak_tests, .pill.unfair_tests { color: var(--danger); background: #faecea; }
+    .pill.needs_repair, .pill.needs_review, .pill.has_gaps, .pill.has_unfair_tests { color: var(--warn); background: #fff4d7; }
+    .pill.question_valid, .pill.pass { color: var(--ok); background: #e8f5ee; }
     pre {
       min-height: 360px;
       max-height: 640px;
@@ -1152,8 +1153,10 @@ INDEX_HTML = """<!doctype html>
       white-space: nowrap;
     }
     .pill.passed, .pill.killed { color: var(--ok); background: #e8f5ee; }
-    .pill.failed, .pill.reference_failed, .pill.weak_tests, .pill.survived { color: var(--danger); background: #faecea; }
+    .pill.failed, .pill.reference_failed, .pill.weak_tests, .pill.unfair_tests, .pill.survived { color: var(--danger); background: #faecea; }
     .pill.difficulty_mismatch { color: var(--warn); background: #fff4d7; }
+    .pill.needs_review, .pill.has_gaps, .pill.has_unfair_tests { color: var(--warn); background: #fff4d7; }
+    .pill.question_valid, .pill.pass { color: var(--ok); background: #e8f5ee; }
     .tabs { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
     .tabs button { background: #eef2f6; color: #344054; }
     .tabs button.active { background: #2f3a46; color: #fff; }
@@ -1383,7 +1386,7 @@ INDEX_HTML = """<!doctype html>
         templateName: selectedTemplate?.name || template,
         userPrompt,
         testcaseCount,
-        design_only: true,
+        design_only: false,
       };
     }
 
@@ -1982,12 +1985,32 @@ INDEX_HTML = """<!doctype html>
       const repairNotes = (result.validation_repairs || []).length
         ? `<h3>AI Repair Notes</h3><pre>${escapeHtml(result.validation_repairs.join('\\n'))}</pre>`
         : '';
+      const cc = result.contract_coverage || {};
+      const contractSection = cc.verdict ? `
+        <h3>Contract-Test Coverage</h3>
+        <p>Verdict: <span class="pill ${escapeHtml(cc.verdict)}">${escapeHtml(cc.verdict)}</span>
+           · Coverage: <strong>${cc.coverage_score != null ? (cc.coverage_score * 100).toFixed(0) + '%' : 'n/a'}</strong>
+           · Fairness: <strong>${cc.fairness_score != null ? (cc.fairness_score * 100).toFixed(0) + '%' : 'n/a'}</strong></p>
+        ${(cc.coverage_gaps || []).length ? `<p><strong>Coverage Gaps</strong> (contract items with no test):</p><ul>${cc.coverage_gaps.map(g => '<li>' + escapeHtml(g) + '</li>').join('')}</ul>` : ''}
+        ${(cc.unfair_tests || []).length ? `<p><strong>Unfair Tests</strong> (testing beyond the contract):</p><ul>${cc.unfair_tests.map(t => '<li><code>' + escapeHtml(t.test || '') + '</code> — ' + escapeHtml(t.reason || '') + '</li>').join('')}</ul>` : ''}
+        ${(cc.issues || []).length ? `<p><strong>Issues:</strong></p><ul>${cc.issues.map(i => '<li>' + escapeHtml(i) + '</li>').join('')}</ul>` : ''}
+      ` : '';
+      const sv = result.solver_validation || {};
+      const solverSection = sv.verdict ? `
+        <h3>Independent Solver Validation</h3>
+        <p>Verdict: <span class="pill ${escapeHtml(sv.verdict)}">${escapeHtml(sv.verdict)}</span></p>
+        <p>${escapeHtml(sv.explanation || '')}</p>
+        ${sv.solver_files ? `<p><strong>Solver produced:</strong> ${sv.solver_files.map(f => '<code>' + escapeHtml(f) + '</code>').join(', ')}</p>` : ''}
+        ${(sv.failed_tests || []).length ? `<p><strong>Failed tests:</strong></p><ul>${sv.failed_tests.map(t => '<li><code>' + escapeHtml(t) + '</code></li>').join('')}</ul>` : ''}
+      ` : '';
       document.getElementById('validationView').innerHTML = `
         <p>Review packet: <code>${escapeHtml(result.review_packet_path || 'not written')}</code></p>
         <table>
           <thead><tr><th>Command/Test</th><th>Status</th><th>Passed</th><th>Reason</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="4">No testcase output recorded.</td></tr>'}</tbody>
         </table>
+        ${contractSection}
+        ${solverSection}
         ${repairNotes}
       `;
     }

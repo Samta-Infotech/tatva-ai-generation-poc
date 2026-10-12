@@ -207,32 +207,44 @@ class ModelGateway:
             headers["OpenAI-Organization"] = settings.OPENAI_ORGANIZATION
         if settings.OPENAI_PROJECT:
             headers["OpenAI-Project"] = settings.OPENAI_PROJECT
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             "response_format": {"type": "json_object"},
-            "max_completion_tokens": num_predict if num_predict is not None else settings.OPENAI_MAX_COMPLETION_TOKENS,
+            "max_completion_tokens": settings.OPENAI_MAX_COMPLETION_TOKENS,
         }
-        try:
-            with httpx.Client(timeout=settings.OPENAI_TIMEOUT_SECONDS, headers=headers) as client:
-                response = client.post(f"{settings.OPENAI_BASE_URL}/chat/completions", json=payload)
-                response.raise_for_status()
-                raw = response.json()
-        except Exception as exc:
-            return {**fallback, "slm_error": str(exc)}
-        content = str((((raw.get("choices") or [{}])[0].get("message") or {}).get("content")) or "").strip()
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            return {**fallback, "slm_error": "OpenAI-compatible response was not valid JSON", "slm_raw": content[:500]}
-        if not isinstance(parsed, dict):
-            return {**fallback, "slm_error": "OpenAI-compatible response JSON was not an object"}
-        parsed.setdefault("provider", self.provider)
-        parsed.setdefault("model", model)
-        return parsed
+        last_error = ""
+        attempts = max(1, getattr(settings, "OPENAI_JSON_RETRIES", 1) + 1)
+        for _ in range(attempts):
+            try:
+                with httpx.Client(timeout=settings.OPENAI_TIMEOUT_SECONDS, headers=headers) as client:
+                    response = client.post(f"{settings.OPENAI_BASE_URL}/chat/completions", json=payload)
+                    response.raise_for_status()
+                    raw = response.json()
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            choice = (raw.get("choices") or [{}])[0]
+            finish_reason = choice.get("finish_reason", "")
+            content = str((choice.get("message") or {}).get("content") or "").strip()
+            if not content:
+                last_error = f"OpenAI returned empty content (finish_reason={finish_reason})"
+                continue
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                last_error = f"OpenAI response was not valid JSON (finish_reason={finish_reason}): {content[:300]}"
+                continue
+            if not isinstance(parsed, dict):
+                last_error = "OpenAI response JSON was not an object"
+                continue
+            parsed.setdefault("provider", self.provider)
+            parsed.setdefault("model", model)
+            return parsed
+        return {**fallback, "slm_error": last_error or "OpenAI response was not valid JSON"}
 
 
 def _resolve_model(value: str, env_value: str) -> str:

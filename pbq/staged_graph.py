@@ -724,7 +724,16 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
         contract = spec.get("behavioral_contract", [])
         manifest = state.get("file_manifest", [])
         test_manifest = [e for e in manifest if e.get("role") == "test_public"]
-        test_path = test_manifest[0]["path"] if test_manifest else _default_test_path(profile, "public")
+        actual_tests = [e for e in test_manifest if "conftest" not in e.get("path", "")]
+        conftest_entries = [e for e in test_manifest if "conftest" in e.get("path", "")]
+        test_path = actual_tests[0]["path"] if actual_tests else _default_test_path(profile, "public")
+
+        conftest_prompt = ""
+        if conftest_entries:
+            conftest_prompt = (
+                f" Also generate a conftest.py file with shared pytest fixtures. "
+                "Include the conftest content as a separate entry in a JSON array. "
+            )
 
         try:
             raw = _call_with_timeout(
@@ -735,6 +744,8 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
                     "Include 2-3 test cases covering the happy path and basic validation. "
                     "Return strict JSON with keys: path, content, kind ('file'). "
                     "Test content must be complete, runnable test code with proper imports. "
+                    "Include all needed fixtures directly in the test file or use Django's built-in test utilities. "
+                    "Do NOT rely on a separate conftest.py — put all fixtures in the test file itself. "
                     f"Framework rules: {framework_generation_rules(profile)}"
                 ),
                 schema_name="PBQStagedTestFile",
@@ -753,6 +764,12 @@ def _make_node_gen_public_tests(ctx: _RuntimeContext):
         if content is None:
             return {"stage_errors": list(state.get("stage_errors", [])) + [
                 {"stage": "gen_public_tests", "file": test_path, "error": "Failed to generate public tests"}
+            ]}
+
+        syntax_error = _validate_file_content(test_path, content, profile.language)
+        if syntax_error:
+            return {"stage_errors": list(state.get("stage_errors", [])) + [
+                {"stage": "gen_public_tests", "file": test_path, "error": f"Syntax error: {syntax_error}"}
             ]}
 
         artifacts = list(state.get("generated_artifacts", []))
@@ -777,7 +794,8 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
         manifest = state.get("file_manifest", [])
         ref_files = state.get("reference_files", [])
         test_manifest = [e for e in manifest if e.get("role") == "test_private"]
-        test_path = test_manifest[0]["path"] if test_manifest else _default_test_path(profile, "private")
+        actual_tests = [e for e in test_manifest if "conftest" not in e.get("path", "")]
+        test_path = actual_tests[0]["path"] if actual_tests else _default_test_path(profile, "private")
 
         # Private tests get reference file summaries to test edge cases
         ref_summary = _interface_summary(ref_files, [e["path"] for e in ref_files])
@@ -791,6 +809,8 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
                     "Include 3-5 test cases covering edge cases, boundary conditions, and error handling. "
                     "These tests must fail when the implementation has subtle bugs. "
                     "Return strict JSON with keys: path, content, kind ('file'). "
+                    "Include all needed fixtures directly in the test file. "
+                    "Do NOT rely on a separate conftest.py — put all fixtures in the test file itself. "
                     f"Framework rules: {framework_generation_rules(profile)}"
                 ),
                 schema_name="PBQStagedTestFile",
@@ -809,6 +829,12 @@ def _make_node_gen_private_tests(ctx: _RuntimeContext):
         if content is None:
             return {"stage_errors": list(state.get("stage_errors", [])) + [
                 {"stage": "gen_private_tests", "file": test_path, "error": "Failed to generate private tests"}
+            ]}
+
+        syntax_error = _validate_file_content(test_path, content, profile.language)
+        if syntax_error:
+            return {"stage_errors": list(state.get("stage_errors", [])) + [
+                {"stage": "gen_private_tests", "file": test_path, "error": f"Syntax error: {syntax_error}"}
             ]}
 
         artifacts = list(state.get("generated_artifacts", []))
@@ -1099,6 +1125,20 @@ def generate_staged_pbq_bundle(
     result = compiled.invoke(initial_state)
     elapsed = time.monotonic() - start_time
     logger.info("Staged PBQ generation completed in %.1fs", elapsed)
+
+    # Retry once on transient failures (empty API response, timeout)
+    if result.get("failed") and not result.get("reference_files"):
+        failure = result.get("failure_reason", "")
+        is_transient = any(kw in failure.lower() for kw in ("not valid json", "timeout", "empty", "timed out"))
+        if is_transient:
+            logger.warning("Staged generation hit transient failure (%s) — retrying once", failure)
+            if on_progress:
+                on_progress("design", "update", "Transient API error — retrying generation...")
+            retry_state: StagedGenState = {**initial_state, "failed": False, "failure_reason": "", "stage_errors": []}
+            result = compiled.invoke(retry_state)
+            retry_elapsed = time.monotonic() - start_time
+            logger.info("Staged PBQ generation retry completed in %.1fs (total)", retry_elapsed)
+            elapsed = retry_elapsed
 
     # Extract results
     plan = result.get("feature_plan", {})

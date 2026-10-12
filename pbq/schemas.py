@@ -38,5 +38,12 @@ class PBQBundle:
     mutations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        return data
+        return {
+            "requirements": self.requirements,
+            "design": asdict(self.design),
+            "starter_files": [f.to_dict() for f in self.starter_files],
+            "public_tests": [f.to_dict() for f in self.public_tests],
+            "private_tests": [f.to_dict() for f in self.private_tests],
+            "reference_solution": [f.to_dict() for f in self.reference_solution],
+            "mutations": self.mutations,
+        }
